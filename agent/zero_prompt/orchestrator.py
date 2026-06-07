@@ -1,0 +1,907 @@
+import asyncio
+import logging
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+
+from agent.zero_prompt.event_bus import push_zp_event
+from agent.zero_prompt.events import (
+    brainstorm_complete_event,
+    brainstorm_start_event,
+    compete_complete_event,
+    compete_start_event,
+    council_message_event,
+    insight_complete_event,
+    insight_start_event,
+    paper_found_event,
+    paper_search_event,
+    session_start_event,
+    transcript_complete_event,
+    transcript_start_event,
+    verdict_go_event,
+    verdict_nogo_event,
+)
+from agent.zero_prompt.queue_manager import BuildQueue
+from agent.zero_prompt.schemas import ZPCard, ZPSession
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TECH_STACK = "FastAPI + Next.js + PostgreSQL"
+_DEFAULT_ESTIMATED_DAYS = 3
+
+VerdictFn = Callable[[str, str, str], Awaitable[tuple[str, int, str, str]]]
+
+
+def _fire(coro: object) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)  # type: ignore[arg-type]
+    except RuntimeError:
+        if hasattr(coro, "close"):
+            coro.close()  # type: ignore[union-attr]
+    except Exception:
+        if hasattr(coro, "close"):
+            coro.close()  # type: ignore[union-attr]
+
+
+async def _db_update_card_safe(card_id: str, **fields: object) -> None:
+    try:
+        from agent.db import zp_store
+
+        await zp_store.update_card(card_id, **fields)
+    except Exception:
+        logger.exception("[ZP] DB update failed for card %s fields=%s", card_id, list(fields.keys()))
+
+
+async def _db_update_session_safe(session_id: str, status: str) -> None:
+    try:
+        from agent.db import zp_store
+
+        await zp_store.update_session_status(session_id, status)
+    except Exception:
+        pass
+
+
+class SessionManager:
+    def __init__(self) -> None:
+        self._sessions: dict[str, ZPSession] = {}
+
+    def create_session(self, goal: int = 10) -> ZPSession:
+        session_id = str(uuid.uuid4())
+        session = ZPSession(
+            session_id=session_id,
+            status="exploring",
+            cards=[],
+            build_queue=[],
+            active_build=None,
+            goal_go_cards=goal,
+            created_at=datetime.now(tz=timezone.utc).isoformat(),
+        )
+        self._sessions[session_id] = session
+        return session
+
+    def get_session(self, session_id: str) -> ZPSession | None:
+        return self._sessions.get(session_id)
+
+    def add_card(self, session_id: str, video_id: str) -> ZPCard | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        card = ZPCard(
+            card_id=str(uuid.uuid4()),
+            video_id=video_id,
+            status="analyzing",
+            score=0,
+            thread_id=None,
+        )
+        session.cards.append(card)
+        return card
+
+    def update_card_status(self, session_id: str, card_id: str, status: str, **kwargs: object) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        for card in session.cards:
+            if card.card_id == card_id:
+                card.status = status  # type: ignore[assignment]
+                for key, value in kwargs.items():
+                    if hasattr(card, key):
+                        setattr(card, key, value)
+                return True
+        return False
+
+    def queue_build(self, session_id: str, card_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        if card_id not in session.build_queue:
+            session.build_queue.append(card_id)
+        return True
+
+    def get_next_build(self, session_id: str) -> str | None:
+        session = self._sessions.get(session_id)
+        if session is None or not session.build_queue:
+            return None
+        bq = deque(session.build_queue)
+        card_id = bq.popleft()
+        session.build_queue = list(bq)
+        session.active_build = card_id
+        return card_id
+
+    def pause_session(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.status = "paused"
+        return True
+
+    def resume_session(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.status = "exploring"
+        return True
+
+    def should_continue_exploring(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        go_ready_count = sum(1 for card in session.cards if card.status == "go_ready")
+        return go_ready_count < session.goal_go_cards
+
+
+class StreamingOrchestrator:
+    def __init__(self) -> None:
+        self._sessions: dict[str, ZPSession] = {}
+        self._build_queues: dict[str, BuildQueue] = {}
+
+    def create_session(self, goal: int = 10) -> tuple[ZPSession, dict]:
+        session_id = str(uuid.uuid4())
+        session = ZPSession(
+            session_id=session_id,
+            status="exploring",
+            cards=[],
+            build_queue=[],
+            active_build=None,
+            goal_go_cards=goal,
+            created_at=datetime.now(tz=timezone.utc).isoformat(),
+        )
+        self._sessions[session_id] = session
+        self._build_queues[session_id] = BuildQueue()
+        event = session_start_event(session_id, goal)
+        _fire(self._db_create_session(session_id, goal))
+        return session, event
+
+    async def _db_create_session(self, session_id: str, goal: int) -> None:
+        try:
+            from agent.db import zp_store
+
+            await zp_store.ensure_session(session_id, goal)
+        except Exception:
+            pass
+
+    async def _hydrate_session_from_db(self, session_id: str) -> ZPSession | None:
+        """Load a session and its cards from the database into memory."""
+        try:
+            from agent.db import zp_store
+
+            data = await zp_store.get_session(session_id)
+            if data is None:
+                return None
+
+            cards: list[ZPCard] = []
+            for cd in data.get("cards", []):
+                try:
+                    card = ZPCard(
+                        card_id=cd.get("card_id", ""),
+                        video_id=cd.get("video_id", ""),
+                        status=cd.get("status", "analyzing"),
+                        score=cd.get("score", 0),
+                        title=cd.get("title", ""),
+                        thread_id=cd.get("thread_id"),
+                        reason=cd.get("reason", ""),
+                        reason_code=cd.get("reason_code", ""),
+                        score_breakdown=cd.get("score_breakdown", {}),
+                        domain=cd.get("domain", ""),
+                        papers_found=cd.get("papers_found", 0),
+                        competitors_found=cd.get("competitors_found", ""),
+                        saturation=cd.get("saturation", ""),
+                        novelty_boost=cd.get("novelty_boost", 0.0),
+                        video_summary=cd.get("video_summary", ""),
+                        insights=cd.get("insights", []),
+                        mvp_proposal=cd.get("mvp_proposal", {}),
+                        build_step=cd.get("build_step", ""),
+                        analysis_step=cd.get("analysis_step", ""),
+                        repo_url=cd.get("repo_url", ""),
+                        live_url=cd.get("live_url", ""),
+                    )
+                    cards.append(card)
+                except Exception:
+                    logger.warning("[ZP] Skipping invalid card in session %s", session_id)
+
+            session = ZPSession(
+                session_id=session_id,
+                status=data.get("status", "exploring"),
+                cards=cards,
+                build_queue=[],
+                active_build=None,
+                goal_go_cards=data.get("goal_go_cards", 10),
+                created_at=str(data.get("created_at", "")),
+            )
+            self._sessions[session_id] = session
+            if session_id not in self._build_queues:
+                self._build_queues[session_id] = BuildQueue()
+
+            logger.info("[ZP] Hydrated session %s from DB (%d cards)", session_id, len(cards))
+            return session
+        except Exception:
+            logger.exception("[ZP] Failed to hydrate session %s from DB", session_id)
+            return None
+
+    async def ensure_session(self, session_id: str) -> ZPSession | None:
+        """Get session from memory, or load from DB if not present."""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        return await self._hydrate_session_from_db(session_id)
+
+    async def load_sessions_from_db(self) -> int:
+        """Load the latest session from DB into memory on startup. Returns count loaded."""
+        try:
+            from agent.db import zp_store
+
+            data = await zp_store.get_dashboard()
+            if data and data.get("session_id"):
+                session_id = data["session_id"]
+                if session_id not in self._sessions:
+                    result = await self._hydrate_session_from_db(session_id)
+                    if result:
+                        logger.info("[ZP] Loaded latest session %s from DB on startup", session_id)
+                        return 1
+        except Exception:
+            logger.exception("[ZP] Failed to load sessions from DB on startup")
+        return 0
+
+    def get_session(self, session_id: str) -> ZPSession | None:
+        return self._sessions.get(session_id)
+
+    def should_continue_exploring(self, session_id: str) -> bool:
+        session = self._sessions.get(session_id)
+        if session is None or session.status != "exploring":
+            return False
+        committed_statuses = {"go_ready", "build_queued", "building", "deployed"}
+        committed_count = sum(1 for card in session.cards if card.status in committed_statuses)
+        return committed_count < session.goal_go_cards
+
+    async def register_card(self, session_id: str, video_id: str, title: str = "") -> str:
+        card_id = str(uuid.uuid4())
+        card = ZPCard(card_id=card_id, video_id=video_id, status="analyzing", score=0, title=title or video_id)
+        session = self._sessions.get(session_id)
+        if session:
+            session.cards.append(card)
+        try:
+            from agent.db import zp_store
+
+            await zp_store.add_card(session_id, card_id, video_id, title or video_id)
+        except Exception:
+            logger.exception("[ZP] Failed to add card %s to DB", card_id)
+        return card_id
+
+    async def exploration_step(
+        self,
+        session_id: str,
+        video_id: str,
+        *,
+        video_title: str = "",
+        video_description: str = "",
+        verdict_fn: VerdictFn | None = None,
+    ) -> list[dict]:
+        session = await self.ensure_session(session_id)
+        if session is None:
+            return []
+
+        card = next((c for c in session.cards if c.video_id == video_id and c.status == "analyzing"), None)
+        if card is None:
+            card_id = str(uuid.uuid4())
+            card = ZPCard(
+                card_id=card_id, video_id=video_id, status="analyzing", score=0, title=video_title or video_id
+            )
+            session.cards.append(card)
+        card_id = card.card_id
+        events: list[dict] = []
+
+        try:
+            from agent.db import zp_store
+
+            await zp_store.add_card(session_id, card_id, video_id, video_title or video_id)
+        except Exception:
+            pass
+        card.analysis_step = "transcript"
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "transcript",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+        await _db_update_card_safe(card_id, analysis_step="transcript")
+
+        events.append(transcript_start_event(video_id))
+        transcript_source = "error"
+        transcript_tokens = 0
+        try:
+            from agent.zero_prompt.transcript import fetch_transcript_artifact
+
+            transcript = await fetch_transcript_artifact(video_id)
+            transcript_text = transcript.text
+            transcript_source = transcript.source
+            transcript_tokens = transcript.token_count
+            events.append(transcript_complete_event(video_id, transcript.source, transcript.token_count))
+        except Exception:
+            transcript_text = f"Video Title: {video_title}\nDescription:\n{video_description}".strip()
+            transcript_source = "metadata_fallback" if transcript_text else "error"
+            transcript_tokens = len(transcript_text.split()) if transcript_text else 0
+            events.append(transcript_complete_event(video_id, transcript_source, transcript_tokens))
+
+        card.analysis_step = "insight"
+        await _db_update_card_safe(card_id, analysis_step="insight")
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "insight",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+        events.append(insight_start_event(video_id))
+        try:
+            from agent.zero_prompt.insight_extractor import extract_insight_from_transcript, extract_with_gemini
+
+            idea = await extract_with_gemini(transcript_text)
+            if idea is None:
+                idea = extract_insight_from_transcript(transcript_text, video_title)
+            events.append(insight_complete_event(idea.domain, len(idea.key_features), idea.confidence_score))
+        except Exception:
+            from agent.zero_prompt.schemas import AppIdea
+
+            idea = AppIdea(name=video_title or video_id, domain="unknown", description="", target_audience="")
+            events.append(insight_complete_event("unknown", 0, 0.0))
+
+        try:
+            await _db_update_card_safe(card_id, domain=idea.domain if idea else "unknown")
+        except Exception:
+            pass
+
+        card.analysis_step = "papers"
+        await _db_update_card_safe(card_id, analysis_step="papers")
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "papers",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+        idea_query = f"{idea.name} {idea.domain}" if idea.name else video_title
+        events.append(paper_search_event(idea_query, ["openalex", "arxiv"]))
+        try:
+            from agent.zero_prompt.paper_search import search_papers
+
+            papers = await search_papers(idea_query, max_results=3)
+            events.append(paper_found_event(len(papers), "openalex+arxiv"))
+        except Exception:
+            papers = []
+            events.append(paper_found_event(0, "error"))
+
+        try:
+            await _db_update_card_safe(card_id, papers_found=len(papers) if papers else 0)
+        except Exception:
+            pass
+
+        card.analysis_step = "brainstorm"
+        await _db_update_card_safe(card_id, analysis_step="brainstorm")
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "brainstorm",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+        events.append(brainstorm_start_event(idea.name or video_title, len(papers)))
+        try:
+            from agent.zero_prompt.paper_brainstorm import enhance_idea_with_papers
+
+            enhanced = enhance_idea_with_papers(idea.description or idea.name, papers)
+            novelty_boost = enhanced.novelty_boost
+            events.append(
+                brainstorm_complete_event(len(enhanced.novel_features), len(enhanced.unexplored_angles), novelty_boost)
+            )
+        except Exception:
+            novelty_boost = 0.0
+            events.append(brainstorm_complete_event(0, 0, 0.0))
+
+        try:
+            await _db_update_card_safe(card_id, novelty_boost=novelty_boost)
+        except Exception:
+            pass
+
+        card.analysis_step = "compete"
+        await _db_update_card_safe(card_id, analysis_step="compete")
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "compete",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+        events.append(compete_start_event(idea.name or video_title))
+        market = None
+        try:
+            from agent.zero_prompt.competitive_analysis import analyze_competition
+
+            market = await analyze_competition(idea.name or video_title)
+            market_opportunity = market.market_opportunity_score
+            events.append(
+                compete_complete_event(len(market.competitors), market.saturation_level, market.search_confidence)
+            )
+        except Exception:
+            market_opportunity = 50
+            events.append(compete_complete_event(0, "medium", "llm_only"))
+
+        try:
+            await _db_update_card_safe(
+                card_id,
+                competitors_found=str(len(market.competitors)) if market else "0",
+                saturation=market.saturation_level if market else "",
+            )
+        except Exception:
+            pass
+
+        if market:
+            saturation = market.saturation_level
+            comp_count = len(market.competitors)
+            opp = market.market_opportunity_score
+            idea_domain = idea.domain if idea else "unknown"
+            if saturation == "low" and opp >= 60:
+                scout_msg = (
+                    f"Scout: {idea_domain.title()} market shows low saturation ({comp_count} known competitors) "
+                    f"with strong opportunity score {opp}/100 — this niche is underserved."
+                )
+            elif saturation == "high" or opp < 40:
+                scout_msg = (
+                    f"Scout: {idea_domain.title()} space is highly saturated ({comp_count} competitors, "
+                    f"opportunity {opp}/100). Entry requires sharp differentiation to survive."
+                )
+            else:
+                scout_msg = (
+                    f"Scout: Moderate competition in {idea_domain} ({comp_count} competitors, "
+                    f"opportunity {opp}/100). Window exists if we move fast."
+                )
+            push_zp_event({**council_message_event("Scout", scout_msg, card_id), "session_id": session_id})
+
+        card.analysis_step = "verdict"
+        await _db_update_card_safe(card_id, analysis_step="verdict")
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "analyzing",
+                "analysis_step": "verdict",
+                "title": card.title,
+                "session_id": session_id,
+            }
+        )
+
+        score_breakdown: dict[str, float | int] = {}
+
+        if verdict_fn is not None:
+            try:
+                decision, score, reason, reason_code = await verdict_fn(session_id, video_id, card_id)
+            except Exception:
+                card.status = "nogo"
+                events.append(verdict_nogo_event(0, "analysis_error", "verdict_exception"))
+                _fire(_db_update_card_safe(card_id, status="nogo"))
+                push_zp_event({"type": "card.update", "card_id": card_id, "status": "nogo", "session_id": session_id})
+                return events
+        else:
+            try:
+                from agent.zero_prompt.card_enrichment import enrich_card_with_gemini
+                from agent.zero_prompt.competitive_analysis import analyze_competition
+                from agent.zero_prompt.paper_brainstorm import enhance_idea_with_papers
+                from agent.zero_prompt.paper_search import search_papers
+                from agent.zero_prompt.verdict import (
+                    build_mvp_score_breakdown,
+                    determine_verdict,
+                    measure_paper_support,
+                )
+
+                enrichment = await enrich_card_with_gemini(
+                    video_title=video_title,
+                    transcript_text=transcript_text,
+                    idea_name=idea.name if idea else "",
+                    idea_domain=idea.domain if idea else "",
+                    idea_features=idea.key_features if idea else [],
+                    paper_titles=[p.title for p in papers[:3]] if papers else [],
+                    market_gaps=market.gaps if market else [],
+                    competitors_count=len(market.competitors) if market else 0,
+                )
+                card.video_summary = enrichment.get("video_summary", "")
+                card.insights = enrichment.get("insights", [])
+                card.mvp_proposal = enrichment.get("mvp_proposal", {})
+
+                mvp = card.mvp_proposal or {}
+                mvp_query = " ".join(
+                    part
+                    for part in [
+                        str(mvp.get("app_name") or "").strip(),
+                        str(mvp.get("core_feature") or "").strip(),
+                        str(mvp.get("target_user") or "").strip(),
+                    ]
+                    if part
+                )
+                mvp_market = await analyze_competition(
+                    mvp_query or (idea.name if idea else video_title), search_limit=8
+                )
+                mvp_papers = await search_papers(mvp_query or (idea.name if idea else video_title), max_results=3)
+                mvp_enhanced = enhance_idea_with_papers(
+                    str(mvp.get("core_feature") or mvp_query or idea.name or video_title),
+                    mvp_papers,
+                )
+                relevant_papers, avg_paper_relevance = measure_paper_support(mvp_query or video_title, mvp_papers)
+                market_opportunity = mvp_market.market_opportunity_score
+                card.competitors_found = str(len(mvp_market.competitors))
+                card.saturation = mvp_market.saturation_level
+                card.papers_found = relevant_papers
+                novelty_boost = mvp_enhanced.novelty_boost if relevant_papers > 0 else 0.0
+
+                score_breakdown = build_mvp_score_breakdown(
+                    mvp_proposal=card.mvp_proposal,
+                    market_opportunity=market_opportunity,
+                    novelty_boost=novelty_boost,
+                    relevant_papers=relevant_papers,
+                    avg_paper_relevance=avg_paper_relevance,
+                    market_gap_count=len(mvp_market.gaps),
+                    market_search_confidence=mvp_market.search_confidence,
+                )
+                raw_score = int(score_breakdown.get("final_score", 0))
+                verdict = determine_verdict(
+                    score=raw_score,
+                    market_viability=int(score_breakdown.get("market_viability_signal", 0)),
+                    mvp_differentiation=int(score_breakdown.get("mvp_differentiation_signal", 0)),
+                    execution_feasibility=int(score_breakdown.get("execution_feasibility_signal", 0)),
+                    evidence_strength=int(score_breakdown.get("evidence_strength_signal", 0)),
+                    novelty_boost=novelty_boost,
+                    originality=int(score_breakdown.get("originality_signal", 0)),
+                )
+                decision = verdict.decision
+                reason = verdict.reason
+                reason_code = verdict.reason_code
+                score = verdict.score
+                score_breakdown["raw_score"] = raw_score
+                score_breakdown["display_score"] = score
+                score_breakdown["gate_blocked"] = raw_score != score
+            except Exception:
+                decision, score, reason, reason_code = "NO_GO", 0, "verdict computation failed", "low_confidence"
+
+        mvp_title = str((card.mvp_proposal or {}).get("app_name") or "").strip()
+        card.title = mvp_title or idea.name or video_title or video_id
+        card.score = score
+        card.reason = reason
+        card.reason_code = reason_code
+        card.score_breakdown = score_breakdown
+        card.domain = idea.domain if idea else ""
+        if not card.competitors_found:
+            card.competitors_found = str(len(market.competitors)) if market else "0"
+        if not card.saturation:
+            card.saturation = market.saturation_level if market else ""
+        card.novelty_boost = novelty_boost
+
+        if decision == "GO":
+            card.status = "go_ready"
+            events.append(verdict_go_event(score, reason, reason_code))
+
+            try:
+                await _db_update_card_safe(
+                    card_id,
+                    title=card.title,
+                    status="go_ready",
+                    score=score,
+                    reason=reason,
+                    reason_code=reason_code,
+                    score_breakdown=card.score_breakdown,
+                    domain=card.domain,
+                    papers_found=card.papers_found,
+                    competitors_found=card.competitors_found,
+                    saturation=card.saturation,
+                    novelty_boost=novelty_boost,
+                    video_summary=card.video_summary,
+                    insights=card.insights,
+                    mvp_proposal=card.mvp_proposal,
+                )
+                push_zp_event(
+                    {
+                        "type": "card.update",
+                        "card_id": card_id,
+                        "status": "go_ready",
+                        "score": score,
+                        "score_breakdown": card.score_breakdown,
+                        "title": card.title,
+                        "session_id": session_id,
+                    }
+                )
+                push_zp_event(
+                    {
+                        "type": "card.enriched",
+                        "card_id": card_id,
+                        "status": "go_ready",
+                        "session_id": session_id,
+                        "title": card.title,
+                        "video_summary": card.video_summary,
+                    }
+                )
+            except Exception:
+                pass
+
+            try:
+                mvp = card.mvp_proposal or {}
+                tech = mvp.get("tech_stack", _DEFAULT_TECH_STACK)
+                pages = mvp.get("key_pages", [])
+                app_name = mvp.get("app_name", card.title)
+                days = mvp.get("estimated_days", _DEFAULT_ESTIMATED_DAYS)
+                if tech and pages:
+                    arch_msg = (
+                        f"Architect: {app_name} maps cleanly to {len(pages)} screens "
+                        f"({', '.join(pages[:3])}). Stack: {tech}. "
+                        f"Estimated {days} day MVP — solid execution path."
+                    )
+                    push_zp_event({**council_message_event("Architect", arch_msg, card_id), "session_id": session_id})
+
+                if card.insights:
+                    catalyst_msg = f"Catalyst: {card.insights[0]}"
+                    push_zp_event(
+                        {**council_message_event("Catalyst", catalyst_msg, card_id), "session_id": session_id}
+                    )
+
+                if len(card.insights) > 1:
+                    advocate_msg = f"Advocate: {card.insights[1]}"
+                    push_zp_event(
+                        {**council_message_event("Advocate", advocate_msg, card_id), "session_id": session_id}
+                    )
+
+            except Exception:
+                logger.exception("[ZP] Card enrichment failed for %s", card_id)
+        else:
+            card.status = "nogo"
+            events.append(verdict_nogo_event(score, reason, reason_code))
+            try:
+                await _db_update_card_safe(
+                    card_id,
+                    title=card.title,
+                    status="nogo",
+                    score=score,
+                    reason=reason,
+                    reason_code=reason_code,
+                    score_breakdown=card.score_breakdown,
+                    domain=card.domain,
+                    papers_found=card.papers_found,
+                    competitors_found=card.competitors_found,
+                    saturation=card.saturation,
+                    novelty_boost=novelty_boost,
+                    video_summary=card.video_summary,
+                    insights=card.insights,
+                    mvp_proposal=card.mvp_proposal,
+                )
+                push_zp_event(
+                    {
+                        "type": "card.update",
+                        "card_id": card_id,
+                        "status": "nogo",
+                        "score": score,
+                        "reason": reason,
+                        "score_breakdown": card.score_breakdown,
+                        "title": card.title,
+                        "session_id": session_id,
+                    }
+                )
+                push_zp_event(
+                    {
+                        "type": "card.enriched",
+                        "card_id": card_id,
+                        "status": "nogo",
+                        "session_id": session_id,
+                        "title": card.title,
+                        "video_summary": card.video_summary,
+                    }
+                )
+            except Exception:
+                pass
+            guardian_msg = f"Guardian: {reason} Recommend skipping and moving to next candidate."
+            push_zp_event({**council_message_event("Guardian", guardian_msg, card_id), "session_id": session_id})
+
+        return events
+
+    def queue_build(self, session_id: str, card_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {"type": "zp.action.error", "error": "session_not_found"}
+
+        card = next((c for c in session.cards if c.card_id == card_id), None)
+        if card is None:
+            return {"type": "zp.action.error", "error": "card_not_found"}
+
+        if card.status != "go_ready":
+            return {"type": "zp.action.error", "error": "card_not_go_ready"}
+
+        bq = self._build_queues[session_id]
+        bq.enqueue(card_id)
+
+        if card_id not in session.build_queue:
+            session.build_queue.append(card_id)
+
+        card.status = "build_queued"
+        _fire(_db_update_card_safe(card_id, status="build_queued"))
+        push_zp_event({"type": "card.update", "card_id": card_id, "status": "build_queued", "session_id": session_id})
+        return {"type": "zp.action.queue_build", "card_id": card_id, "queue_length": len(session.build_queue)}
+
+    def pass_card(self, session_id: str, card_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        card = None
+        if session:
+            card = next((c for c in session.cards if c.card_id == card_id), None)
+            if card and card_id in session.build_queue:
+                session.build_queue.remove(card_id)
+            bq = self._build_queues.get(session_id)
+            if bq:
+                bq.remove(card_id)
+
+        if card:
+            card.status = "passed"
+        _fire(_db_update_card_safe(card_id, status="passed"))
+        push_zp_event({"type": "card.update", "card_id": card_id, "status": "passed", "session_id": session_id})
+        return {"type": "zp.action.pass_card", "card_id": card_id}
+
+    def delete_card(self, session_id: str, card_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        card = None
+        if session:
+            card = next((c for c in session.cards if c.card_id == card_id), None)
+
+        if card:
+            card.status = "deleted"
+        _fire(_db_update_card_safe(card_id, status="deleted"))
+        push_zp_event(
+            {
+                "type": "card.update",
+                "card_id": card_id,
+                "status": "deleted",
+                "title": card.title if card else "",
+                "session_id": session_id,
+            }
+        )
+        return {"type": "zp.action.delete_card", "card_id": card_id}
+
+    def delete_rejected_cards(self, session_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {"type": "zp.action.error", "error": "session_not_found"}
+
+        rejected_statuses = {"nogo", "passed", "build_failed"}
+        deleted_card_ids: list[str] = []
+
+        for card in session.cards:
+            if card.status not in rejected_statuses:
+                continue
+            card.status = "deleted"
+            deleted_card_ids.append(card.card_id)
+            _fire(_db_update_card_safe(card.card_id, status="deleted"))
+            push_zp_event(
+                {
+                    "type": "card.update",
+                    "card_id": card.card_id,
+                    "status": "deleted",
+                    "title": card.title,
+                    "session_id": session_id,
+                }
+            )
+
+        push_zp_event(
+            {
+                "type": "zp.cards.bulk_deleted",
+                "deleted_count": len(deleted_card_ids),
+                "deleted_card_ids": deleted_card_ids,
+                "session_id": session_id,
+            }
+        )
+        return {"type": "zp.action.delete_rejected_cards", "deleted_count": len(deleted_card_ids)}
+
+    def pause(self, session_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {"type": "zp.action.error", "error": "session_not_found"}
+
+        session.status = "paused"
+        _fire(_db_update_session_safe(session_id, "paused"))
+        return {"type": "zp.action.pause", "session_id": session_id}
+
+    def resume(self, session_id: str) -> dict:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {"type": "zp.action.error", "error": "session_not_found"}
+
+        if session.status != "paused":
+            return {"type": "zp.action.error", "error": "session_not_paused"}
+
+        session.status = "exploring"
+        _fire(_db_update_session_safe(session_id, "exploring"))
+        return {"type": "zp.action.resume", "session_id": session_id}
+
+    def start_next_build(self, session_id: str) -> str | None:
+        bq = self._build_queues.get(session_id)
+        if bq is None:
+            return None
+
+        card_id = bq.dequeue()
+        if card_id is None:
+            return None
+
+        session = self._sessions.get(session_id)
+        if session is None:
+            return card_id
+
+        session.active_build = card_id
+
+        if card_id in session.build_queue:
+            session.build_queue.remove(card_id)
+
+        for card in session.cards:
+            if card.card_id == card_id:
+                card.status = "building"
+                break
+
+        _fire(_db_update_card_safe(card_id, status="building"))
+        push_zp_event({"type": "card.update", "card_id": card_id, "status": "building", "session_id": session_id})
+        return card_id
+
+    def finish_build(
+        self, session_id: str, card_id: str, *, success: bool = True, thread_id: str | None = None
+    ) -> dict:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return {"type": "zp.action.error", "error": "session_not_found"}
+
+        bq = self._build_queues.get(session_id)
+        if bq:
+            bq.mark_complete(card_id)
+
+        if session.active_build == card_id:
+            session.active_build = None
+
+        final_status = "deployed" if success else "build_failed"
+        for card in session.cards:
+            if card.card_id == card_id:
+                card.status = final_status  # type: ignore[assignment]
+                if thread_id is not None:
+                    card.thread_id = thread_id
+                break
+
+        db_fields: dict[str, object] = {"status": final_status}
+        if thread_id is not None:
+            db_fields["thread_id"] = thread_id
+        _fire(_db_update_card_safe(card_id, **db_fields))
+        push_zp_event({"type": "card.update", "card_id": card_id, "status": final_status, "session_id": session_id})
+
+        return {"type": "zp.build.complete" if success else "zp.build.failed", "card_id": card_id}

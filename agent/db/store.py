@@ -1,0 +1,376 @@
+import asyncio
+import json
+import os
+from typing import Literal, Optional
+
+import aiosqlite
+from pydantic import BaseModel, Field
+
+
+class LineageRecord(BaseModel):
+    record_id: str
+    record_type: Literal["meeting", "brainstorm", "zero_prompt_session", "build_job", "deployment"]
+    parent_id: str | None = None
+    thread_id: str
+    metadata: dict = Field(default_factory=dict)
+    created_at: str
+
+
+class LineageStore:
+    def __init__(self) -> None:
+        self._records: dict[str, LineageRecord] = {}
+
+    def save_record(self, record: LineageRecord) -> str:
+        self._records[record.record_id] = record
+        return record.record_id
+
+    def get_record(self, record_id: str) -> LineageRecord | None:
+        return self._records.get(record_id)
+
+    def get_lineage(self, thread_id: str) -> list[LineageRecord]:
+        matches = [r for r in self._records.values() if r.thread_id == thread_id]
+        return sorted(matches, key=lambda r: r.created_at)
+
+    def get_children(self, parent_id: str) -> list[LineageRecord]:
+        return [r for r in self._records.values() if r.parent_id == parent_id]
+
+    def get_chain(self, record_id: str) -> list[LineageRecord]:
+        chain: list[LineageRecord] = []
+        current_id: str | None = record_id
+        visited: set[str] = set()
+        while current_id is not None:
+            if current_id in visited:
+                break
+            visited.add(current_id)
+            record = self._records.get(current_id)
+            if record is None:
+                break
+            chain.append(record)
+            current_id = record.parent_id
+        return chain
+
+    def get_summary(self) -> dict:
+        by_type: dict[str, int] = {
+            "meeting": 0,
+            "brainstorm": 0,
+            "zero_prompt_session": 0,
+            "build_job": 0,
+            "deployment": 0,
+        }
+        for record in self._records.values():
+            by_type[record.record_type] += 1
+        return {"total": len(self._records), "by_type": by_type}
+
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meeting_results (
+    thread_id TEXT PRIMARY KEY,
+    result TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS brainstorm_results (
+    thread_id TEXT PRIMARY KEY,
+    result TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_PG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meeting_results (
+    thread_id TEXT PRIMARY KEY,
+    result JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS brainstorm_results (
+    thread_id TEXT PRIMARY KEY,
+    result JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
+
+class ResultStore:
+    """Dual-backend store: PostgreSQL (production) or SQLite (tests).
+
+    - No args or db_url=<postgres url> → PostgreSQL via asyncpg
+    - db_path=":memory:" → SQLite in-memory (for tests)
+    """
+
+    def __init__(self, db_path: str | None = None, db_url: str | None = None):
+        self._use_pg = False
+        self._db_path = db_path
+        self._db_url = db_url
+        self._db: Optional[aiosqlite.Connection] = None
+        self._pool = None
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+        if db_path == ":memory:":
+            self._use_pg = False
+        elif db_url or os.environ.get("DATABASE_URL"):
+            self._use_pg = True
+            self._db_url = db_url or os.environ.get("DATABASE_URL", "")
+        elif db_path:
+            self._use_pg = False
+        else:
+            db_env = os.environ.get("DATABASE_URL", "")
+            if db_env:
+                self._use_pg = True
+                self._db_url = db_env
+            else:
+                self._use_pg = False
+                self._db_path = "vibedeploy.db"
+
+    async def init(self):
+        if self._initialized:
+            return
+        if self._use_pg:
+            from .connection import get_pool
+
+            self._pool = await get_pool()
+            async with self._pool.acquire() as conn:
+                for stmt in _PG_SCHEMA.strip().split(";"):
+                    stmt = stmt.strip()
+                    if stmt:
+                        await conn.execute(stmt)
+        else:
+            self._db = await aiosqlite.connect(self._db_path or ":memory:")
+            await self._db.executescript(_SQLITE_SCHEMA)
+            if self._db_path and self._db_path != ":memory:":
+                await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.commit()
+        self._initialized = True
+
+    async def _ensure_ready(self):
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self.init()
+
+    async def close(self):
+        if self._use_pg:
+            from .connection import close_pool
+
+            await close_pool()
+            self._pool = None
+        else:
+            if self._db:
+                await self._db.close()
+                self._db = None
+        self._initialized = False
+
+    async def save_meeting(self, thread_id: str, result: dict):
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO meeting_results (thread_id, result)
+                       VALUES ($1, $2::jsonb)
+                       ON CONFLICT (thread_id)
+                       DO UPDATE SET result = $2::jsonb, created_at = NOW()""",
+                    thread_id,
+                    json.dumps(result, ensure_ascii=False),
+                )
+        else:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO meeting_results (thread_id, result) VALUES (?, ?)",
+                (thread_id, json.dumps(result, ensure_ascii=False)),
+            )
+            await self._db.commit()
+
+    async def replace_meetings(self, records: list[tuple[str, dict]]):
+        await self._ensure_ready()
+        thread_ids = [thread_id for thread_id, _result in records]
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    if thread_ids:
+                        await conn.execute(
+                            "DELETE FROM meeting_results WHERE NOT (thread_id = ANY($1::text[]))",
+                            thread_ids,
+                        )
+                    else:
+                        await conn.execute("DELETE FROM meeting_results")
+
+                    for thread_id, result in records:
+                        await conn.execute(
+                            """INSERT INTO meeting_results (thread_id, result)
+                               VALUES ($1, $2::jsonb)
+                               ON CONFLICT (thread_id)
+                               DO UPDATE SET result = $2::jsonb""",
+                            thread_id,
+                            json.dumps(result, ensure_ascii=False),
+                        )
+        else:
+            if thread_ids:
+                placeholders = ",".join("?" for _ in thread_ids)
+                await self._db.execute(
+                    f"DELETE FROM meeting_results WHERE thread_id NOT IN ({placeholders})",
+                    thread_ids,
+                )
+            else:
+                await self._db.execute("DELETE FROM meeting_results")
+
+            for thread_id, result in records:
+                await self._db.execute(
+                    """INSERT INTO meeting_results (thread_id, result)
+                       VALUES (?, ?)
+                       ON CONFLICT(thread_id) DO UPDATE SET result = excluded.result""",
+                    (thread_id, json.dumps(result, ensure_ascii=False)),
+                )
+            await self._db.commit()
+
+    async def get_meeting(self, thread_id: str) -> Optional[dict]:
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT result FROM meeting_results WHERE thread_id = $1",
+                    thread_id,
+                )
+                if row is None:
+                    return None
+                r = row["result"]
+                return json.loads(r) if isinstance(r, str) else r
+        else:
+            cursor = await self._db.execute(
+                "SELECT result FROM meeting_results WHERE thread_id = ?",
+                (thread_id,),
+            )
+            row = await cursor.fetchone()
+            return json.loads(row[0]) if row else None
+
+    async def save_brainstorm(self, thread_id: str, result: dict):
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO brainstorm_results (thread_id, result)
+                       VALUES ($1, $2::jsonb)
+                       ON CONFLICT (thread_id)
+                       DO UPDATE SET result = $2::jsonb, created_at = NOW()""",
+                    thread_id,
+                    json.dumps(result, ensure_ascii=False),
+                )
+        else:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO brainstorm_results (thread_id, result) VALUES (?, ?)",
+                (thread_id, json.dumps(result, ensure_ascii=False)),
+            )
+            await self._db.commit()
+
+    async def get_brainstorm(self, thread_id: str) -> Optional[dict]:
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT result FROM brainstorm_results WHERE thread_id = $1",
+                    thread_id,
+                )
+                if row is None:
+                    return None
+                r = row["result"]
+                return json.loads(r) if isinstance(r, str) else r
+        else:
+            cursor = await self._db.execute(
+                "SELECT result FROM brainstorm_results WHERE thread_id = ?",
+                (thread_id,),
+            )
+            row = await cursor.fetchone()
+            return json.loads(row[0]) if row else None
+
+    async def list_meetings(self, limit: int = 50) -> list[dict]:
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT thread_id, result, created_at FROM meeting_results ORDER BY created_at DESC LIMIT $1",
+                    limit,
+                )
+                results = []
+                for r in rows:
+                    res = json.loads(r["result"]) if isinstance(r["result"], str) else r["result"]
+                    results.append(
+                        {
+                            "thread_id": r["thread_id"],
+                            **res,
+                            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                        }
+                    )
+                return results
+        else:
+            cursor = await self._db.execute(
+                "SELECT thread_id, result, created_at FROM meeting_results ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [{"thread_id": r[0], **json.loads(r[1]), "created_at": r[2]} for r in rows]
+
+    async def list_brainstorms(self, limit: int = 50) -> list[dict]:
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT thread_id, result, created_at FROM brainstorm_results ORDER BY created_at DESC LIMIT $1",
+                    limit,
+                )
+                results = []
+                for r in rows:
+                    res = json.loads(r["result"]) if isinstance(r["result"], str) else r["result"]
+                    results.append(
+                        {
+                            "thread_id": r["thread_id"],
+                            **res,
+                            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                        }
+                    )
+                return results
+        else:
+            cursor = await self._db.execute(
+                "SELECT thread_id, result, created_at FROM brainstorm_results ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [{"thread_id": r[0], **json.loads(r[1]), "created_at": r[2]} for r in rows]
+
+    async def get_stats(self) -> dict:
+        await self._ensure_ready()
+        if self._use_pg:
+            async with self._pool.acquire() as conn:
+                m_count = await conn.fetchval("SELECT COUNT(*) FROM meeting_results")
+                b_count = await conn.fetchval("SELECT COUNT(*) FROM brainstorm_results")
+                avg_score_raw = await conn.fetchval("SELECT AVG((result->>'score')::float) FROM meeting_results")
+                avg_score = round(avg_score_raw, 1) if avg_score_raw else 0
+                go_count = await conn.fetchval("SELECT COUNT(*) FROM meeting_results WHERE result->>'verdict' = 'GO'")
+                return {
+                    "total_meetings": m_count,
+                    "total_brainstorms": b_count,
+                    "avg_score": avg_score,
+                    "go_count": go_count,
+                    "nogo_count": m_count - go_count,
+                }
+        else:
+            m_cursor = await self._db.execute("SELECT COUNT(*) FROM meeting_results")
+            m_count = (await m_cursor.fetchone())[0]
+
+            b_cursor = await self._db.execute("SELECT COUNT(*) FROM brainstorm_results")
+            b_count = (await b_cursor.fetchone())[0]
+
+            avg_cursor = await self._db.execute("SELECT AVG(json_extract(result, '$.score')) FROM meeting_results")
+            avg_row = await avg_cursor.fetchone()
+            avg_score = round(avg_row[0], 1) if avg_row[0] else 0
+
+            go_cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM meeting_results WHERE json_extract(result, '$.verdict') = 'GO'"
+            )
+            go_count = (await go_cursor.fetchone())[0]
+
+            return {
+                "total_meetings": m_count,
+                "total_brainstorms": b_count,
+                "avg_score": avg_score,
+                "go_count": go_count,
+                "nogo_count": m_count - go_count,
+            }

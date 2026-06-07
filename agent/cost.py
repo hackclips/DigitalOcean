@@ -1,0 +1,114 @@
+from dataclasses import dataclass, field
+
+from .providers.pricing import PRICING as SURCHARGE_PRICING
+from .providers.pricing import calculate_cost
+
+PRICING_PER_MILLION = {
+    "openai-gpt-oss-120b": (0.10, 0.70),
+    "openai-gpt-oss-20b": (0.05, 0.45),
+    "deepseek-r1-distill-llama-70b": (0.99, 0.99),
+    "alibaba-qwen3-32b": (0.25, 0.55),
+    "anthropic-claude-opus-4.6": (5.00, 25.00),
+    "anthropic-claude-4.6-sonnet": (3.00, 15.00),
+    "fal-ai/flux/schnell": (3.00, 3.00),
+}
+
+for _model_id, _spec in SURCHARGE_PRICING.items():
+    if _model_id not in PRICING_PER_MILLION:
+        PRICING_PER_MILLION[_model_id] = (_spec["input_per_million"], _spec["output_per_million"])
+
+DB_MONTHLY_COST = 15.15
+
+
+@dataclass
+class CostTracker:
+    entries: list[dict] = field(default_factory=list)
+
+    def record(
+        self,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        step: str = "",
+        *,
+        cached_input_tokens: int = 0,
+        surcharge_type: str = "",
+    ):
+        surcharge_spec = SURCHARGE_PRICING.get(model)
+        if surcharge_spec:
+            cost = calculate_cost(
+                model_id=model,
+                input_tokens=input_tokens - cached_input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+            )
+        else:
+            input_price, output_price = PRICING_PER_MILLION.get(model, (0.0, 0.0))
+            cost = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+
+        self.entries.append(
+            {
+                "model": model,
+                "step": step,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "surcharge_type": surcharge_type,
+                "cost_usd": round(cost, 6),
+            }
+        )
+
+    @property
+    def total_cost(self) -> float:
+        return round(sum(e["cost_usd"] for e in self.entries), 6)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(e["input_tokens"] for e in self.entries)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(e["output_tokens"] for e in self.entries)
+
+    def summary(self) -> dict:
+        by_model: dict[str, float] = {}
+        for e in self.entries:
+            by_model[e["model"]] = by_model.get(e["model"], 0) + e["cost_usd"]
+
+        return {
+            "total_cost_usd": self.total_cost,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "steps": len(self.entries),
+            "cost_by_model": {k: round(v, 6) for k, v in sorted(by_model.items(), key=lambda x: -x[1])},
+            "db_monthly_cost_usd": DB_MONTHLY_COST,
+        }
+
+
+def estimate_pipeline_cost() -> dict:
+    """Estimate cost for a full evaluation pipeline run based on typical token usage."""
+    estimates = [
+        ("claude-sonnet-4-6", 2000, 3000, "input_processor"),
+        ("claude-sonnet-4-6", 2000, 4000, "architect"),
+        ("claude-sonnet-4-6", 2000, 4000, "scout"),
+        ("claude-sonnet-4-6", 2000, 4000, "guardian"),
+        ("claude-sonnet-4-6", 2000, 4000, "catalyst"),
+        ("claude-sonnet-4-6", 2000, 4000, "advocate"),
+        ("claude-sonnet-4-6", 8000, 6000, "cross_examination"),
+        ("gpt-5.4", 10000, 5000, "strategist_verdict"),
+        ("gpt-5.4", 3000, 8000, "doc_generation"),
+        ("gpt-5.3-codex", 5000, 16000, "code_generation"),
+        ("gpt-5.4", 2500, 4000, "brainstorm"),
+        ("gpt-5.4", 2500, 3500, "brainstorm_synthesis"),
+        ("claude-sonnet-4-6", 1500, 2500, "web_search"),
+        ("fal-ai/flux/schnell", 500, 500, "image_generation"),
+    ]
+
+    tracker = CostTracker()
+    for model, inp, out, step in estimates:
+        tracker.record(model, inp, out, step)
+
+    return {
+        **tracker.summary(),
+        "note": "Estimated cost per full pipeline run (idea → deploy)",
+    }
