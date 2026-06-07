@@ -6,22 +6,6 @@
 </p>
 
 <p align="center">
-  <a href="https://DigitalOcean-7tgzk.ondigitalocean.app"><img src="https://img.shields.io/badge/LIVE%20DEMO-DigitalOcean.ondigitalocean.app-00C853?style=for-the-badge&logo=digitalocean&logoColor=white" alt="Live Demo"/></a>
-  <a href="https://github.com/Two-Weeks-Team/DigitalOcean"><img src="https://img.shields.io/badge/GitHub-Two--Weeks--Team%2FDigitalOcean-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Repository"/></a>F
-</p>
-
-<p align="center">
-  <em>Demo video link: add the final public YouTube or Vimeo URL before submission.</em>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License: MIT"/></a>
-  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/actions"><img src="https://img.shields.io/github/actions/workflow/status/Two-Weeks-Team/DigitalOcean/ci.yml?style=flat-square&label=CI" alt="CI"/></a>
-  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/issues"><img src="https://img.shields.io/github/issues/Two-Weeks-Team/DigitalOcean?style=flat-square&color=orange" alt="Issues"/></a>
-  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/pulls"><img src="https://img.shields.io/github/issues-pr/Two-Weeks-Team/DigitalOcean?style=flat-square&color=blue" alt="PRs"/></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/python-3.12.4-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12.4"/>
   <img src="https://img.shields.io/badge/next.js-16.1.7-000000?style=flat-square&logo=next.js&logoColor=white" alt="Next.js 16.1.7"/>
   <img src="https://img.shields.io/badge/Gradient%20ADK-0.2.11-0080FF?style=flat-square&logo=digitalocean" alt="Gradient ADK 0.2.11"/>
