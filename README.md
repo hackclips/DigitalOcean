@@ -1,10 +1,26 @@
 <h1 align="center">DigitalOcean</h1>
 
 <p align="center">
-  <strong>One click starts discovery. A live Kanban ranks ideas. You choose a GO card to build. DigitalOcean ships the app to Real World
-  </strong><br/>
+  <strong>One click starts discovery. A live Kanban ranks ideas. You choose a GO card to build. DigitalOcean ships the app to DigitalOcean.</strong><br/>
   <em>Zero-Prompt discovery, AI evaluation, type-safe code generation, build validation, and deployment in one flow.</em>
 </p>
+
+<p align="center">
+  <a href="https://DigitalOcean-7tgzk.ondigitalocean.app"><img src="https://img.shields.io/badge/LIVE%20DEMO-DigitalOcean.ondigitalocean.app-00C853?style=for-the-badge&logo=digitalocean&logoColor=white" alt="Live Demo"/></a>
+  <a href="https://github.com/Two-Weeks-Team/DigitalOcean"><img src="https://img.shields.io/badge/GitHub-Two--Weeks--Team%2FDigitalOcean-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Repository"/></a>F
+</p>
+
+<p align="center">
+  <em>Demo video link: add the final public YouTube or Vimeo URL before submission.</em>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License: MIT"/></a>
+  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/actions"><img src="https://img.shields.io/github/actions/workflow/status/Two-Weeks-Team/DigitalOcean/ci.yml?style=flat-square&label=CI" alt="CI"/></a>
+  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/issues"><img src="https://img.shields.io/github/issues/Two-Weeks-Team/DigitalOcean?style=flat-square&color=orange" alt="Issues"/></a>
+  <a href="https://github.com/Two-Weeks-Team/DigitalOcean/pulls"><img src="https://img.shields.io/github/issues-pr/Two-Weeks-Team/DigitalOcean?style=flat-square&color=blue" alt="PRs"/></a>
+</p>
+
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12.4-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12.4"/>
   <img src="https://img.shields.io/badge/next.js-16.1.7-000000?style=flat-square&logo=next.js&logoColor=white" alt="Next.js 16.1.7"/>
@@ -14,6 +30,11 @@
   <img src="https://img.shields.io/badge/DO%20Capabilities-13-0080FF?style=flat-square&logo=digitalocean" alt="13 DigitalOcean capabilities"/>
 </p>
 
+<p align="center">
+  <img src="screenshots/zero-prompt-kanban-board.png" alt="Zero-Prompt Kanban board with live GO, building, and rejected idea cards" width="1200"/>
+</p>
+
+---
 
 ## Overview
 
