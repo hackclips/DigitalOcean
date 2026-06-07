@@ -179,10 +179,3 @@ DigitalOcean/
 `- screenshots/         # demo and README assets
 ```
 
-## License
-
-`MIT` — see `LICENSE`.
-
-<p align="center">
-  <sub>Maintained by <a href="https://github.com/Two-Weeks-Team">Two-Weeks-Team</a></sub>
-</p>
