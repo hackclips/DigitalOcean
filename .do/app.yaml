@@ -1,0 +1,141 @@
+name: vibedeploy
+region: nyc
+
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+ingress:
+  rules:
+    # NextAuth routes now at /auth/api/* (handled by web catch-all)
+    # API endpoints → backend
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /api
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /run
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /resume
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /health
+    # /dashboard and /zero-prompt are Next.js pages (auth-protected).
+    # Their API sub-routes (/dashboard/stats, /zero-prompt/start, etc.)
+    # are accessed via /api/ prefix by the frontend (DASHBOARD_API_URL).
+    # Everything else → frontend (Next.js handles its own routing)
+    - component:
+        name: web
+      match:
+        path:
+          prefix: /
+
+services:
+  - name: api
+    environment_slug: python
+    github:
+      repo: Two-Weeks-Team/vibeDeploy
+      branch: main
+      deploy_on_push: true
+    source_dir: agent
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: professional-xs
+    build_command: pip install langchain-gradient>=0.1.24 --no-deps
+    run_command: python run_server.py
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: ENC[REPLACE_WITH_DB_URL]
+      - key: DIGITALOCEAN_INFERENCE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_MODEL_ACCESS_KEY
+      - key: GRADIENT_MODEL_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_MODEL_ACCESS_KEY
+      - key: DIGITALOCEAN_API_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_API_TOKEN
+      - key: GITHUB_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_GITHUB_TOKEN
+      - key: GITHUB_ORG
+        scope: RUN_TIME
+        value: Two-Weeks-Team
+      - key: DO_KNOWLEDGE_BASE_ID
+        scope: RUN_TIME
+        value: REPLACE_WITH_KB_ID
+      - key: VIBEDEPLOY_ADK_URL
+        scope: RUN_TIME
+        value: REPLACE_WITH_ADK_URL
+      - key: VIBEDEPLOY_ADK_AUTH_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_ADK_AUTH_TOKEN
+      - key: GOOGLE_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_GOOGLE_API_KEY
+      - key: VIBEDEPLOY_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_API_KEY
+      - key: VIBEDEPLOY_CORS_ORIGINS
+        scope: RUN_TIME
+        value: ${APP_URL}
+
+  - name: web
+    environment_slug: node-js
+    github:
+      repo: Two-Weeks-Team/vibeDeploy
+      branch: main
+      deploy_on_push: true
+    source_dir: web
+    http_port: 3000
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    build_command: npm install && npm run build && cp -r .next/static .next/standalone/.next/static && cp -r public .next/standalone/public
+    run_command: node .next/standalone/server.js
+    envs:
+      - key: NEXT_PUBLIC_AGENT_URL
+        scope: BUILD_TIME
+        value: ${APP_URL}
+      - key: PORT
+        scope: RUN_TIME
+        value: "3000"
+      - key: HOSTNAME
+        scope: RUN_TIME
+        value: "0.0.0.0"
+      - key: VIBEDEPLOY_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_API_KEY
+      - key: GOOGLE_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_GOOGLE_CLIENT_ID
+      - key: GOOGLE_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_GOOGLE_CLIENT_SECRET
+      - key: AUTH_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_WITH_AUTH_SECRET
+      - key: AUTH_URL
+        scope: RUN_TIME
+        value: ${APP_URL}
