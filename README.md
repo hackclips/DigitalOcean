@@ -1,7 +1,8 @@
 <h1 align="center">DigitalOcean</h1>
 
 <p align="center">
-  <strong>One click starts discovery. A live Kanban ranks ideas. You choose a GO card to build. DigitalOcean ships the app to DigitalOcean.</strong><br/>
+  <strong>One click starts discovery. A live Kanban ranks ideas. You choose a GO card to build. DigitalOcean ships the app to Real World
+  </strong><br/>
   <em>Zero-Prompt discovery, AI evaluation, type-safe code generation, build validation, and deployment in one flow.</em>
 </p>
 <p align="center">
